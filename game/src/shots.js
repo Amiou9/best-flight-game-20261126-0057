@@ -1,79 +1,149 @@
-// The screenshot scenes behind ?shot=start|play|end. Each one plays the real rules forward from a
-// fresh world for a fixed number of steps, steered by a simple autopilot (look ahead each way the
-// paddle could move, keep clear of blocks, chase the lowest coin when that is safe), so the frame
-// is what a short game really looks like and the same seed always gives the same frame.
-import { FIELD, PLAYER, STEP } from './config.js';
-import { EVENT_OVER, KIND_BLOCK } from './world.js';
-import { SCREEN_OVER, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
+// The screenshot scenes behind ?shot=start|play|ring|end. Each one flies the
+// real flight model forward from a fresh sortie with a simple autopilot —
+// steer toward the next ring, hold its altitude, throttle back for the
+// landing — so the frame is what a real flight looks like and the same seed
+// always gives the same frame.
+import { RING_COURSE, RUNWAY, STEP } from './config.js';
+import { groundHeight } from './ground.js';
 
-const START_SECONDS = 5;
-const PLAY_SECONDS = 26;
-const END_LIMIT_SECONDS = 600;
-/**
- * How far ahead, in seconds, the autopilot checks each way it could move: the play scene's pilot
- * looks well ahead and keeps all its lives; the end scene's looks only a moment ahead, so it is
- * caught out once the blocks speed up, as a hurried player is.
- */
-const HORIZON_PLAY = 0.7;
-const HORIZON_END = 0.25;
-const SAMPLE = 1 / 30;
-const DIRECTIONS = [0, -1, 1];
-/** Extra room, each side, it keeps between the paddle and a block. */
-const MARGIN = 10;
-
-/** Seconds until moving in `direction` (-1, 0, 1) runs the paddle into a block; Infinity when it never does. */
-function timeToHit(state, direction, horizon) {
-  const player = state.player;
-  for (let t = SAMPLE; t <= horizon; t += SAMPLE) {
-    const x = Math.min(FIELD.width - player.width, Math.max(0, player.x + direction * PLAYER.speed * t));
-    for (let index = 0; index < state.items.length; index += 1) {
-      const item = state.items[index];
-      if (!item.active || item.kind !== KIND_BLOCK) continue;
-      const y = item.y + item.speed * t;
-      if (y + item.height > player.y && y < player.y + player.height && item.x < x + player.width + MARGIN && item.x + item.width > x - MARGIN) return t;
-    }
-  }
-  return Infinity;
+function wrapAngle(angle) {
+  while (angle > Math.PI) angle -= Math.PI * 2;
+  while (angle < -Math.PI) angle += Math.PI * 2;
+  return angle;
 }
 
-/** Of the safe ways to move, the one toward the lowest coin (or the centre); else the one that is hit last. */
-function autopilot(state, horizon) {
-  const player = state.player;
-  let coin = null;
-  for (let index = 0; index < state.items.length; index += 1) {
-    const item = state.items[index];
-    if (item.active && item.kind !== KIND_BLOCK && (coin === null || item.y > coin.y)) coin = item;
+/** Roll that turns toward `desiredHeading` at a rate proportional to the
+ * heading error — so the turn dies away as the error closes, instead of
+ * saturating the bank and orbiting the target forever. */
+function steerToHeading(state, desiredHeading) {
+  const error = wrapAngle(desiredHeading - state.heading);
+  const turnFactor = 0.85 * (0.35 + 0.65 * (state.speed / 46));
+  const desiredTurnRate = Math.max(-0.7, Math.min(0.7, error * 1.1));
+  return Math.max(-1, Math.min(1, -desiredTurnRate / turnFactor));
+}
+
+/** Steering toward a point at a target altitude, from the flight state.
+ * Full-bank steering: right for chasing rings far apart at speed. */
+function autopilotControl(state, targetX, targetY, targetZ, throttle) {
+  const dx = targetX - state.x;
+  const dz = targetZ - state.z;
+  const desiredHeading = Math.atan2(dx, -dz);
+  const headingError = wrapAngle(desiredHeading - state.heading);
+  const altitudeError = targetY - state.y;
+  return {
+    roll: Math.max(-1, Math.min(1, -headingError * 1.6)),
+    pitch: Math.max(-1, Math.min(1, altitudeError * 0.06 - state.verticalSpeed * 0.09)),
+    throttle,
+    brake: false,
+  };
+}
+
+/** The same steering with the proportional turn from steerToHeading: for
+ * the slow fix leg, where full bank would orbit the fix point forever. */
+function gentleControl(state, targetX, targetY, targetZ, throttle) {
+  const dx = targetX - state.x;
+  const dz = targetZ - state.z;
+  const desiredHeading = Math.atan2(dx, -dz);
+  const altitudeError = targetY - state.y;
+  return {
+    roll: steerToHeading(state, desiredHeading),
+    pitch: Math.max(-1, Math.min(1, altitudeError * 0.06 - state.verticalSpeed * 0.09)),
+    throttle,
+    brake: false,
+  };
+}
+
+/** The flight home: fly the runway axis, not a point. A point target makes
+ * a fast plane orbit it forever; a line target (heading south down the strip,
+ * correcting the lateral offset) converges. Altitude follows the ground
+ * 12–20 m below the plane, so it climbs over the volcano instead of into
+ * it, then settles onto the glide slope for the last 200 m. */
+let goingAround = false;
+
+function returnControl(state) {
+  if (state.z > 80) goingAround = true;
+  if (state.z < -200) goingAround = false;
+  if (goingAround) {
+    // Overshot to the south: go around, back north for another pass.
+    return autopilotControl(state, 0, 40, -300, 0.4);
   }
-  const target = coin === null ? FIELD.width / 2 : coin.x + coin.width / 2;
-  const centre = player.x + player.width / 2;
-  const wanted = target > centre + 8 ? 1 : target < centre - 8 ? -1 : 0;
-  let best = wanted;
-  let bestTime = timeToHit(state, wanted, horizon);
-  for (let index = 0; index < DIRECTIONS.length && bestTime !== Infinity; index += 1) {
-    const time = timeToHit(state, DIRECTIONS[index], horizon);
-    if (time > bestTime) {
-      bestTime = time;
-      best = DIRECTIONS[index];
-    }
+  const ground = groundHeight(state.x, state.z);
+  const desiredHeading = Math.PI + Math.max(-0.7, Math.min(0.7, state.x * 0.015));
+  const floor = state.z > -200 ? 0.9 : 12;
+  const glide = Math.max(floor, Math.min(20, (-100 - state.z) * 0.09));
+  // Hold altitude until the plane is on the centreline: descending while
+  // still 100 m off-line puts it down on the grass past the strip's end.
+  const targetY = ground + (Math.abs(state.x) < 30 ? glide : Math.max(20, glide));
+  const slopeRate = state.z < -100 ? 0.09 * state.speed : 0;
+  const desiredVs = Math.max(-5, Math.min(2, (targetY - state.y) * 0.5 - slopeRate));
+  // Pitch holds the desired descent rate: a feedforward term for the pitch
+  // that descent needs, plus a correction on the rate error. Without the
+  // feedforward the loop settles a third short of the rate it asks for, and
+  // the plane floats over the strip forever.
+  const pitchFeedforward = desiredVs / Math.max(8, state.speed * 0.85 * 0.42);
+  const pitch = Math.max(-0.8, Math.min(0.8, pitchFeedforward + (desiredVs - state.verticalSpeed) * 0.3));
+  return {
+    roll: steerToHeading(state, desiredHeading),
+    pitch,
+    throttle: state.z < -400 ? 0.4 : 0.22,
+    brake: state.z > -180 && state.speed > 24,
+  };
+}
+
+function controlFor(flight) {
+  const state = flight.state;
+  const ring = flight.nextRing();
+  if (ring) {
+    return autopilotControl(state, ring.x, ring.y, ring.z, 0.72);
   }
-  return best;
+  if (state.y < 62 && state.z < -500) {
+    // Rings done, still out by the far rings: climb to 65 m first — above
+    // the volcano's western slope — while turning toward (80, -480), east of
+    // the volcano, so the turn home never sweeps the plane across the
+    // volcano's western slope at ring altitude. (Only out here: once the
+    // plane is homeward, the return profile owns the descent and must not be
+    // interrupted by a re-climb.)
+    return autopilotControl(state, 80, 65, -480, 0.5);
+  }
+  return returnControl(state);
+}
+
+/** Fly the sortie forward until `stopWhen(state)` is true or time runs out. */
+function flyUntil(flight, stopWhen, maxSeconds) {
+  const steps = Math.floor(maxSeconds / STEP);
+  for (let i = 0; i < steps; i += 1) {
+    flight.step(controlFor(flight));
+    if (stopWhen(flight.state)) break;
+    if (flight.state.status === 'landed' || flight.state.status === 'crashed') break;
+  }
 }
 
 /**
- * Set `world` to the named scene (start, play or end; any other name is start) and return the
- * screen to draw over it and the best score to show.
+ * Set `flight` to the named scene (start, play, ring or end; any other name
+ * is start) and return the screen to draw over it.
  */
-export function stageShot(name, world) {
-  world.reset();
-  if (name !== 'play' && name !== 'end') {
-    for (let index = 0; index < START_SECONDS / STEP; index += 1) world.step(STEP, 0, true);
-    return { screen: SCREEN_TITLE, best: 0 };
+export function stageShot(name, flight) {
+  flight.reset();
+  if (name === 'play') {
+    flyUntil(flight, (state) => state.time >= 26, 30);
+    flight.state.status = 'flying';
+    return { screen: 'play' };
   }
-  const limit = name === 'end' ? END_LIMIT_SECONDS : PLAY_SECONDS;
-  const horizon = name === 'end' ? HORIZON_END : HORIZON_PLAY;
-  for (let index = 0; index < limit / STEP; index += 1) {
-    if (world.step(STEP, autopilot(world.state, horizon), false) & EVENT_OVER) break;
+  if (name === 'ring') {
+    const target = RING_COURSE[2];
+    flyUntil(
+      flight,
+      (state) => Math.hypot(state.x - target.x, state.y - target.y, state.z - target.z) < 65,
+      90,
+    );
+    flight.state.status = 'flying';
+    return { screen: 'play' };
   }
-  const over = world.state.lives === 0;
-  return { screen: over ? SCREEN_OVER : SCREEN_PLAY, best: world.state.score };
+  if (name === 'end') {
+    flyUntil(flight, (state) => state.status === 'landed', 600);
+    return { screen: 'over' };
+  }
+  // start: parked on the strip, engine off, title over the runway.
+  flight.state.status = 'ready';
+  return { screen: 'title' };
 }
