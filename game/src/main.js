@@ -226,7 +226,7 @@ function runGame() {
     }
   });
 
-  announce('Nusantara Sky Run. Press Enter or click to fly.');
+  announce('Langit Nusantara. Press Enter or click to fly.');
   requestAnimationFrame(frame);
 }
 

@@ -1,4 +1,4 @@
-// Nusantara Sky Run — a 3D flight game for the make.fun bounty "Make the best
+// Langit Nusantara — a 3D flight game for the make.fun bounty "Make the best
 // flight game" (best-flight-game-20261126-0057), entered as @amiou9. The game
 // is this directory's game/ folder, plain static files a desktop browser loads
 // offline (game/index.html and its ES modules, three.js 0.187.0 vendored as
